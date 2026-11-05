@@ -15,6 +15,11 @@ copy will need. Then it copies just the missing files and confirms when the sour
   as the source isn't inside the target. Process them one at a time, in any order.
 - **Single Python file, no dependencies** (Python ≥ 3.11, Linux).
 
+> **⚠️ Use at your own risk.** This is a hobby tool, provided as-is, without any warranty.
+> If you lose, corrupt or fry your data, that's on you, not on the author. Keep a backup of
+> anything you can't afford to lose, and run `check` before you wipe a drive.
+> See [LICENSE](LICENSE).
+
 ## Typical commands
 
 ```bash
