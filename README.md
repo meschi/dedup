@@ -11,7 +11,8 @@ copy will need. Then it copies just the missing files and confirms when the sour
   Wiping old drives is your decision.
 - **Compares content, not names or dates.** A photo renamed and re-copied five times is still recognised as one photo.
 - **Works on folders, not disks.** The target and each source are plain directories: a whole drive, one
-  backup folder on it, or a subfolder of your storage. Process them one at a time, in any order.
+  backup folder on it, or a subfolder of your storage. Two folders on the same disk work too, as long
+  as the source isn't inside the target. Process them one at a time, in any order.
 - **Single Python file, no dependencies** (Python ≥ 3.11, Linux).
 
 ## Typical commands
@@ -57,7 +58,7 @@ Files go to `TARGET/_import/<source-name>/`, keeping their original folder struc
 - **Git repos are copied whole** if anything in them is new, so they keep working. Use
   `compare --whole PATTERN` for other folders that must stay complete, e.g. `--whole '*.app'`.
 - Empty files (`__init__.py`, `.gitkeep`, …) and empty folders are always copied.
-- File timestamps and permissions are preserved. Folder timestamps, xattrs and ACLs are not.
+- File timestamps and permissions are preserved. Not handled: folder timestamps, xattrs and ACLs.
 - Not copied: symlinks, device files, unreadable files (reported), and system junk like `$RECYCLE.BIN`,
   `.Trash-*`, `System Volume Information`, `lost+found`. Use `--no-default-excludes` to include those.
 
@@ -89,37 +90,34 @@ the target, so you can always trace where a file went.
   since then would still count as present. Before wiping a drive, run `check` without it.
 - `--label NAME` picks the folder name under `_import/` (default: the source folder's name).
 
-### Duplicates inside the target: rmlint and duperemove
+### Cleaning up the target: removing duplicates with rmlint
 
-`dedup` only compares sources against the target. For duplicates *inside* the target, use these:
+`dedup` never deletes, so after importing, the target still holds duplicates: things you've
+sorted into your structure, the leftovers in `_import/`, and old duplicates that were on the target
+before. To end up with one clean folder structure, remove them with
+[rmlint](https://github.com/sahib/rmlint) (`sudo apt install rmlint`).
 
-```bash
-# Report only: summary on screen, details in rmlint.json, nothing is changed
-rmlint /mnt/store -o summary -o json:rmlint.json
-
-# Also find whole duplicate folders
-rmlint /mnt/store -D -o summary -o json:rmlint.json
-
-# Second opinion on a source: what in SOURCE is not in TARGET? (paths after // are the "originals")
-rmlint SOURCE // /mnt/store --keep-all-tagged --must-match-tagged -o summary -o uniques:unique.txt
-```
-
-To free space without deleting anything (btrfs/XFS only), make identical files share their disk
-blocks. Every file, path and timestamp stays as it is:
+A good workflow: build your structure in one folder (here `Sorted/`), move things into it from
+`_import/`, and let rmlint delete everything elsewhere that already exists in `Sorted/`.
 
 ```bash
-# with rmlint: generate a script that clones duplicates, review it, then run it
-rmlint /mnt/store -T df -o sh:rmlint.sh -c sh:handler=clone
-less rmlint.sh
-./rmlint.sh -n     # dry run first
-./rmlint.sh
+cd ~            # rmlint writes rmlint.sh / rmlint.json into the current folder: run it outside the target
 
-# or with duperemove (sudo apt install duperemove); -d dedupes, without it it only reports
-duperemove -dr --hashfile=/tmp/dr.hash /mnt/store
+# 1. Overview: duplicate files and whole duplicate folders. Changes nothing.
+rmlint -T df,dd /mnt/store -o summary -o json:rmlint.json
+
+# 2. Delete in _import/ whatever already exists in Sorted/.
+#    Paths after // are "originals": never deleted (-k), and only their duplicates count (-m).
+rmlint -T df /mnt/store/_import // /mnt/store/Sorted -k -m -o sh:rmlint.sh -o summary
+./rmlint.sh -n          # dry run: lists what would be deleted
+./rmlint.sh -p -c       # delete; -p re-checks each file byte by byte first, -c removes folders left empty
+
+# 3. Duplicates anywhere else: -S decides which copy is kept, e.g. shortest path (d), then oldest (m)
+rmlint -T df /mnt/store -S dm -o sh:rmlint.sh -o summary
+less rmlint.sh          # check which copies it keeps before running it
 ```
 
-⚠️ Running `rmlint` itself never changes anything. It writes `rmlint.json` and an `rmlint.sh` script,
-and only *running that script* acts on the files. By default rmlint's script deletes duplicates **and
-also empty files, empty folders and broken symlinks**. Pass `-T df` to handle duplicate files only,
-and use `./rmlint.sh -n` for a dry run. Blocks still held by a btrfs snapshot are only freed once
-that snapshot is deleted.
+⚠️ Running `rmlint` itself never changes anything. It writes `rmlint.json` and an `rmlint.sh`
+script, and only *running that script* deletes files. Always pass `-T df` (duplicate files only):
+by default the script also deletes **empty files, empty folders and broken symlinks**.
+The next normal `dedup` run notices the deletions automatically.
