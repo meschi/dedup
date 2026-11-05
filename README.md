@@ -36,6 +36,10 @@ Optional:
 ./dedup.py index /mnt/store --exclude .snapshots   # ignore a folder in the target (setting is stored)
 ```
 
+**Interrupted? Just run the same command again.** Ctrl-C (or a closed terminal) stops cleanly and
+prints the command to continue. Already computed hashes and already copied files are kept and
+skipped. Only the quick scan of file names and sizes starts over. Press Ctrl-C twice to quit at once.
+
 ## Details
 
 ### What gets copied, and where
@@ -80,6 +84,9 @@ the target, so you can always trace where a file went.
 - Keep btrfs snapshots outside the target folder, or exclude them (`index --exclude .snapshots`).
   Otherwise a file that only survives in a snapshot would count as present.
 - `--jobs 4` hashes in parallel. That helps on SSDs; leave it at 1 for spinning disks.
+- `--no-reindex` (compare/import/check) skips the index refresh, which can take an hour on large
+  HDD targets. Only use it if you haven't changed the target since the last run. Files deleted
+  since then would still count as present. Before wiping a drive, run `check` without it.
 - `--label NAME` picks the folder name under `_import/` (default: the source folder's name).
 
 ### Duplicates inside the target: rmlint and duperemove
@@ -102,14 +109,17 @@ blocks. Every file, path and timestamp stays as it is:
 
 ```bash
 # with rmlint: generate a script that clones duplicates, review it, then run it
-rmlint /mnt/store -o sh:rmlint.sh -c sh:handler=clone
+rmlint /mnt/store -T df -o sh:rmlint.sh -c sh:handler=clone
 less rmlint.sh
+./rmlint.sh -n     # dry run first
 ./rmlint.sh
 
 # or with duperemove (sudo apt install duperemove); -d dedupes, without it it only reports
 duperemove -dr --hashfile=/tmp/dr.hash /mnt/store
 ```
 
-⚠️ By default rmlint writes an `rmlint.sh` that **deletes** duplicates. Running `rmlint` itself is
-safe; read the script before you run it. Blocks still held by a btrfs snapshot are only freed once
+⚠️ Running `rmlint` itself never changes anything. It writes `rmlint.json` and an `rmlint.sh` script,
+and only *running that script* acts on the files. By default rmlint's script deletes duplicates **and
+also empty files, empty folders and broken symlinks**. Pass `-T df` to handle duplicate files only,
+and use `./rmlint.sh -n` for a dry run. Blocks still held by a btrfs snapshot are only freed once
 that snapshot is deleted.

@@ -25,9 +25,11 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sqlite3
 import stat
 import sys
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -56,6 +58,22 @@ CAT_LABEL = {
 
 
 # ----------------------------------------------------------------------------- helpers
+
+STOP = threading.Event()   # set by Ctrl-C / SIGTERM / SIGHUP; long loops check it
+RUN = {'store': None, 'cmd': None, 'reindexed': False}
+
+
+class Stopped(KeyboardInterrupt):
+    pass
+
+
+def on_signal(signum, frame):
+    if STOP.is_set():
+        sys.stderr.write('\nquitting immediately\n')
+        os._exit(130)
+    STOP.set()
+    sys.stderr.write('\nstopping — saving progress (press Ctrl-C again to quit immediately) …\n')
+    raise Stopped
 
 def die(msg):
     sys.stderr.write(f'error: {msg}\n')
@@ -120,8 +138,17 @@ def open_ro(path):
 
 
 def full_hash(path, size=None):
+    h = hasher()
+    buf = bytearray(BUF)
+    mv = memoryview(buf)
     with open_ro(path) as f:
-        return hashlib.file_digest(f, hasher).digest()
+        while True:
+            if STOP.is_set():
+                raise Stopped
+            n = f.readinto(buf)
+            if not n:
+                return h.digest()
+            h.update(mv[:n])
 
 
 def partial_hash(path, size):
@@ -143,6 +170,8 @@ def partial_hash(path, size):
 def hash_many(items, func, jobs):
     """items: tuples starting with (abs_path, size). Yields (item, result | OSError)."""
     def work(it):
+        if STOP.is_set():
+            raise Stopped
         try:
             return it, func(it[0], it[1])
         except OSError as e:
@@ -291,6 +320,7 @@ class Store:
         except BlockingIOError:
             die('another dedup run is using this target')
         self.db = sqlite3.connect(os.fsdecode(self.dir + b'/index.sqlite'), isolation_level=None)
+        RUN['store'] = self
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA synchronous=NORMAL')
         self.db.execute('PRAGMA cache_size=-262144')
@@ -414,6 +444,24 @@ def refresh_index(st, rehash_all=False):
         msg += f'\n  {c["skipped"]} symlinks/special files ignored'
     print(msg, file=sys.stderr)
     return c
+
+
+def ensure_index(st, args):
+    """Refresh the target index unless --no-reindex. Returns None if refreshed, else the time of
+    the last refresh (the index may be stale)."""
+    last = st.meta('refreshed')
+    if not getattr(args, 'no_reindex', False):
+        refresh_index(st)
+        RUN['reindexed'] = True
+        return None
+    if last is None:
+        print('no target index yet — building it despite --no-reindex', file=sys.stderr)
+        refresh_index(st)
+        return None
+    print(f'WARNING: --no-reindex: using the target index from {last}. Changes on the target since then\n'
+          f'         (deleted, moved or edited files) are not seen. Files deleted since then still count\n'
+          f'         as present, so their source copies would NOT be imported.', file=sys.stderr)
+    return last
 
 
 def hash_target_all(st, jobs):
@@ -938,7 +986,7 @@ def cmd_compare(args):
                   f'pass --label to keep sources apart', file=sys.stderr)
     excludes = source_excludes(args)
     whole = ([] if args.no_git_whole else ['.git']) + (args.whole or [])
-    refresh_index(st)
+    stale = ensure_index(st, args)
     st.new_plan(label, 'plan')
     st.attach_cache(label)
     st.db.execute('BEGIN')
@@ -1008,7 +1056,7 @@ def cmd_import(args):
     if os.fsencode(st.meta('source', '', 'p')) != source:
         die(f'plan was made for {st.meta("source", "", "p")} — run compare for this source')
     st.attach_cache(label)
-    refresh_index(st)
+    stale = ensure_index(st, args)
     gen = int(st.meta('gen'))
 
     rows = db.execute(f"SELECT s.id, d.path, s.name, s.size, s.mtime, s.hash, s.cat, s.forced FROM p.src s "
@@ -1136,9 +1184,12 @@ def cmd_import(args):
                 batch_bytes, batch_t = 0, time.monotonic()
     except KeyboardInterrupt:
         _unlink(tmp)
+        sys.stderr.write('writing remaining data to disk …\n')
         commit_synced()
         db.execute('COMMIT')
-        print('\ninterrupted — progress is saved; run import again to continue', file=sys.stderr)
+        print(f'interrupted after {status["copied"]:,} files ({hsize(prog.b)}) were copied; they are saved.\n'
+              f'To continue, run the same command again — copied files are skipped:\n  {resume_cmd()}',
+              file=sys.stderr)
         sys.exit(130)
     except OSError as e:
         _unlink(tmp)
@@ -1250,7 +1301,7 @@ def cmd_check(args):
             pass
         st.db.execute('DETACH o')
     excludes = source_excludes(args, prev_ex)
-    refresh_index(st)
+    stale = ensure_index(st, args)
     st.new_plan(label, 'check')
     st.attach_cache(label)
     scan_source(st, source, excludes, prune)
@@ -1274,7 +1325,11 @@ def cmd_check(args):
         print('not checked: ' + ', '.join(f'{v} {k}' for k, v in sorted(others.items())) +
               ' (symlinks / special files / excluded paths)')
     if not missing and not unread_dirs:
-        print('✓ SAFE: every file on the source has identical content somewhere on the target.')
+        if stale:
+            print(f'✓ SAFE as of the target index from {stale} (--no-reindex). If anything was deleted or\n'
+                  f'  changed on the target since then, run check again without --no-reindex before wiping.')
+        else:
+            print('✓ SAFE: every file on the source has identical content somewhere on the target.')
     else:
         unread = sum(1 for m in missing if m[3] == 'error') + len(unread_dirs)
         print(f'✗ NOT SAFE: {len(missing) - unread + len(unread_dirs):,} files missing on target, '
@@ -1285,6 +1340,32 @@ def cmd_check(args):
             print(f'  … {len(missing) - 20} more')
         print(f'full list: {show(out)}')
         sys.exit(1)
+
+
+def resume_cmd():
+    import shlex
+    argv = list(sys.argv)
+    if RUN['reindexed'] and RUN['cmd'] in ('compare', 'import') and '--no-reindex' not in argv:
+        argv.append('--no-reindex')  # the refresh finished this run; no need to walk again
+    return ' '.join(shlex.quote(a) for a in argv)
+
+
+def interrupted():
+    st = RUN['store']
+    if st is not None and st.db.in_transaction:
+        st.db.execute('ROLLBACK')  # never keep a half-done refresh; hashes up to the last commit stay
+    cmd = RUN['cmd']
+    what = {
+        'index': 'The index was not changed by the interrupted refresh; hashes already computed are kept.',
+        'compare': 'No plan was made yet; hashes already computed are kept and will not be recomputed.',
+        'check': 'Nothing was changed.',
+    }.get(cmd, 'Progress is saved.')
+    hint = ''
+    if RUN['reindexed'] and cmd in ('compare', 'import'):
+        hint = '\n(the target index refresh had finished, so --no-reindex skips it — fine as long as the\n' \
+               ' target is not changed in between)'
+    sys.stderr.write(f'interrupted. {what}\nTo continue, run:\n  {resume_cmd()}{hint}\n')
+    sys.exit(130)
 
 
 def main():
@@ -1308,6 +1389,9 @@ def main():
         p.add_argument('target')
         p.add_argument('source')
         p.add_argument('--label', help='name under _import/ (default: source folder name)')
+        p.add_argument('--no-reindex', action='store_true',
+                       help='skip the target index refresh (fast, but target changes since the last '
+                            'refresh are not seen)')
         if name != 'import':
             p.add_argument('--exclude', action='append', metavar='PATTERN',
                            help='extra glob on name or relative path to skip on the source')
@@ -1328,7 +1412,13 @@ def main():
     args = ap.parse_args()
     if getattr(args, 'exclude', None) == ['']:
         args.exclude = []
-    args.func(args)
+    RUN['cmd'] = args.cmd
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, on_signal)
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        interrupted()
 
 
 if __name__ == '__main__':
