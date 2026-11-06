@@ -24,23 +24,28 @@ import fnmatch
 import hashlib
 import json
 import os
+import queue
 import re
+import shutil
 import signal
 import sqlite3
 import stat
 import sys
 import threading
 import time
-from collections import Counter
+from collections import Counter, namedtuple
 from concurrent.futures import ThreadPoolExecutor
 
 CHUNK = 64 * 1024            # partial hash reads this much from head and tail
+FULL_READ_MAX = 2 * 1024 * 1024  # files up to this size are read in full instead of head + tail:
+                             # on a HDD one seek plus 2 MB of transfer costs about as much as two seeks
 BUF = 1024 * 1024            # copy / full-hash buffer
 DEDUP_DIR = b'.dedup'
 IMPORT_DIR = b'_import'
 PARTIAL_SUFFIX = b'.dedup-partial'
 FOLDERS = {'new': b'new', 'older': b'older_versions', 'newer': b'newer_on_source'}
 COPY_CATS = tuple(FOLDERS)
+SCAN_MAX_AGE = 3600          # compare warns when reusing a source scan older than this
 MTIME_TOL_NS = 2_000_000_000  # FAT has 2 s timestamp resolution
 BLOCK = 4096
 DEFAULT_SOURCE_EXCLUDES = [
@@ -151,20 +156,32 @@ def full_hash(path, size=None):
             h.update(mv[:n])
 
 
-def partial_hash(path, size):
-    """-> (phash, full hash or None). Files <= 2*CHUNK are fully hashed; phash == hash then."""
-    if size <= 2 * CHUNK:
-        h = full_hash(path)
-        return h, h
-    with open_ro(path) as f:
-        fd = f.fileno()
-        head = os.pread(fd, CHUNK, 0)
-        tail = os.pread(fd, CHUNK, size - CHUNK)
+def _phash(size, head, tail):
     h = hashlib.blake2b(digest_size=16, person=b'dedup-partial')
     h.update(size.to_bytes(8, 'little'))
     h.update(head)
     h.update(tail)
-    return h.digest(), None
+    return h.digest()
+
+
+def partial_hash(path, size):
+    """-> (phash, full hash or None). phash covers the size plus the first and last CHUNK bytes;
+    files <= 2*CHUNK are hashed whole (phash == hash). Files <= FULL_READ_MAX are read once in full
+    and return both hashes, so they never need a second read."""
+    if size <= 2 * CHUNK:
+        h = full_hash(path)
+        return h, h
+    if size <= FULL_READ_MAX:
+        with open_ro(path) as f:
+            data = f.readall()
+        h = hasher()
+        h.update(data)
+        return _phash(size, data[:CHUNK], data[size - CHUNK:size]), h.digest()
+    with open_ro(path) as f:
+        fd = f.fileno()
+        head = os.pread(fd, CHUNK, 0)
+        tail = os.pread(fd, CHUNK, size - CHUNK)
+    return _phash(size, head, tail), None
 
 
 def hash_many(items, func, jobs):
@@ -200,7 +217,7 @@ class Progress:
             self.last = now
             self._print(now, False)
 
-    def _print(self, now, final):
+    def text(self, now, final):
         el = max(now - self.t0, 1e-6)
         parts = [f'{self.what}:', f'{self.f:,}' + (f'/{self.tf:,}' if self.tf else '') + ' files']
         if self.b or self.tb:
@@ -213,17 +230,103 @@ class Progress:
             parts.append(f'in {hdur(el)}')
         elif self.tb and self.b:
             parts.append('ETA ' + hdur((self.tb - self.b) / (self.b / el)))
-        elif self.tf and self.f:
+        elif self.tf and self.f and self.tf > self.f:
             parts.append('ETA ' + hdur((self.tf - self.f) / (self.f / el)))
-        line = ' '.join(parts)
-        if self.tty:
-            sys.stderr.write('\r\x1b[K' + line + ('\n' if final else ''))
-        else:
-            sys.stderr.write(line + '\n')
-        sys.stderr.flush()
+        return ' '.join(parts)
+
+    def _print(self, now, final):
+        status_line(self.tty, self.text(now, final), final)
 
     def done(self):
         self._print(time.monotonic(), True)
+
+
+def status_line(tty, line, final):
+    if tty:
+        if not final:  # an overlong line would wrap and break the in-place redraw
+            line = line[:shutil.get_terminal_size().columns - 1]
+        sys.stderr.write('\r\x1b[K' + line + ('\n' if final else ''))
+    else:
+        sys.stderr.write(line + '\n')
+    sys.stderr.flush()
+
+
+class MultiProgress:
+    """One status line for several Progress counters running at the same time."""
+    def __init__(self, subs):
+        self.subs = subs
+        self.end = [None] * len(subs)
+        self.tty = sys.stderr.isatty()
+        self.last = time.monotonic()
+
+    def add(self, i, files, nbytes):
+        self.subs[i].f += files
+        self.subs[i].b += nbytes
+        now = time.monotonic()
+        if now - self.last >= (0.5 if self.tty else 30):
+            self.last = now
+            parts = []
+            for s, e in zip(self.subs, self.end):
+                name = s.what.rsplit(' ', 1)[-1]
+                if e is not None:
+                    parts.append(f'{name} done')
+                    continue
+                el = max(now - s.t0, 1e-6)
+                eta = f' ETA {hdur((s.tb - s.b) / (s.b / el))}' if s.b and s.tb else ''
+                pct = f'{100 * s.b / s.tb:.1f}%' if s.tb else hsize(s.b)
+                parts.append(f'{name} {pct} {hsize(s.b / el)}/s{eta}')
+            status_line(self.tty, self.subs[0].what.rsplit(' ', 1)[0] + ': ' + ' · '.join(parts), False)
+
+    def finish(self, i):
+        self.end[i] = time.monotonic()
+
+    def done(self):
+        if self.tty:
+            sys.stderr.write('\r\x1b[K')
+        for s, e in zip(self.subs, self.end):
+            status_line(False, s.text(e or time.monotonic(), True), True)
+
+
+class step:
+    """Context manager: prints 'what …' and the duration, for silent database work."""
+    def __init__(self, what):
+        self.what = what
+
+    def __enter__(self):
+        self.t0 = time.monotonic()
+        sys.stderr.write(f'{self.what} …')
+        sys.stderr.flush()
+
+    def __exit__(self, exc, *_):
+        sys.stderr.write(f' {hdur(time.monotonic() - self.t0)}\n' if exc is None else '\n')
+
+
+def prefetch_db(db):
+    """Read the database files sequentially once, so the random lookups that follow hit RAM
+    instead of seeking on a spinning disk. Skipped if they don't fit comfortably in memory."""
+    paths = []
+    for _, _, f in db.execute('PRAGMA database_list'):
+        for p in (f, f + '-wal') if f else ():
+            if os.path.exists(p):
+                paths.append(p)
+    total = sum(os.path.getsize(p) for p in paths)
+    try:
+        with open('/proc/meminfo') as m:
+            avail = next(int(l.split()[1]) * 1024 for l in m if l.startswith('MemAvailable:'))
+    except (OSError, StopIteration):
+        return
+    if total > avail // 2:
+        return
+    prog = Progress('loading databases into memory', len(paths), total)
+    buf = bytearray(8 * BUF)
+    for p in paths:
+        with open(p, 'rb', buffering=0) as f:
+            while n := f.readinto(buf):
+                if STOP.is_set():
+                    raise Stopped
+                prog.add(0, n)
+        prog.add(1)
+    prog.done()
 
 
 def walk(root, excludes, prune=()):
@@ -491,11 +594,13 @@ def hash_target_all(st, jobs):
 
 # ----------------------------------------------------------------------------- source scan + classify
 
-def scan_source(st, source, excludes, prune):
+def scan_source(st, source, excludes, prune, events=None, what='scanning source', expect=None):
+    """Fill p.sdirs / p.src / p.skipped from a walk of the source (or from a saved scan's events).
+    expect: file count of the previous scan, used only for the ETA."""
     db = st.db
-    prog = Progress('scanning source', reads=False)
+    prog = Progress(what, expect, reads=False)
     db.execute('BEGIN')
-    for kind, rel, data in walk(source, excludes, prune):
+    for kind, rel, data in (walk(source, excludes, prune) if events is None else events):
         if kind != 'dir':
             db.execute('INSERT INTO p.skipped VALUES(?,?,?)', (rel, kind, data))
             continue
@@ -513,81 +618,194 @@ def scan_source(st, source, excludes, prune):
     prog.done()
 
 
-def classify(st, source, jobs, mode='compare', label=None, whole=()):
+SavedStat = namedtuple('SavedStat', 'st_size st_mtime_ns st_dev st_ino')
+SCAN_SCHEMA = '''
+CREATE TABLE s.meta(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE s.sdirs(id INTEGER PRIMARY KEY, path BLOB NOT NULL);
+CREATE TABLE s.files(dir INTEGER, name BLOB, size INTEGER, mtime INTEGER, dev INTEGER, ino INTEGER);
+CREATE TABLE s.skipped(path BLOB, kind TEXT, reason TEXT);
+'''
+
+
+def save_scan(st, label, source, excludes):
+    """Copy the fresh source scan from the plan to plans/<label>.scan.sqlite, so a re-run of compare
+    (e.g. after Ctrl-C) doesn't have to walk the source again. Written to a temp file, then renamed."""
+    path = st.plan_path(label, 'scan')
+    tmp = path + b'.tmp'
+    for f in (tmp, tmp + b'-journal'):
+        if os.path.exists(f):
+            os.unlink(f)
+    st.attach(tmp, 's')
+    db = st.db
+    db.executescript(SCAN_SCHEMA)
+    db.execute('BEGIN')
+    db.execute('INSERT INTO s.sdirs SELECT id, path FROM p.sdirs')
+    db.execute('INSERT INTO s.files SELECT dir, name, size, mtime, dev, ino FROM p.src')
+    db.execute('INSERT INTO s.skipped SELECT path, kind, reason FROM p.skipped')
+    for k, v in (('source', os.fsdecode(source)), ('excludes', json.dumps(excludes)),
+                 ('scanned', time.time())):
+        st.set_meta(k, v, 's')
+    db.execute('COMMIT')
+    db.execute('CREATE INDEX s.files_dir ON files(dir)')
+    db.execute('DETACH s')
+    os.replace(tmp, path)
+
+
+def previous_scan_count(st, label, source):
+    """Number of files the last complete scan of this source found (for an ETA), or None."""
+    for kind, table in (('scan', 'files'), ('plan', 'src')):
+        path = st.plan_path(label, kind)
+        if not os.path.exists(path):
+            continue
+        st.attach(path, 'x')
+        try:
+            if (os.fsencode(st.meta('source', '', 'x')) == source
+                    and (kind == 'scan' or st.meta('complete', '0', 'x') == '1')):
+                return st.db.execute(f'SELECT count(*) FROM x.{table}').fetchone()[0]
+        except sqlite3.DatabaseError:
+            pass
+        finally:
+            st.db.execute('DETACH x')
+    return None
+
+
+def attach_saved_scan(st, label, source, excludes):
+    """Attach plans/<label>.scan.sqlite as 's' if it was made for this source with these excludes.
+    Returns its scan time (epoch seconds) or None."""
+    path = st.plan_path(label, 'scan')
+    if not os.path.exists(path):
+        return None
+    st.attach(path, 's')
+    try:
+        if (os.fsencode(st.meta('source', '', 's')) == source
+                and json.loads(st.meta('excludes', 'null', 's')) == excludes):
+            return float(st.meta('scanned', None, 's'))
+    except (sqlite3.DatabaseError, ValueError, TypeError):
+        pass
+    st.db.execute('DETACH s')
+    return None
+
+
+def saved_events(db):
+    """Replay a saved scan in the same shape as walk()."""
+    for rel, kind, reason in db.execute('SELECT path, kind, reason FROM s.skipped').fetchall():
+        yield kind, rel, reason
+    cur, rel_cur, files = None, None, []
+    for did, rel, name, size, mtime, dev, ino in db.execute(
+            'SELECT d.id, d.path, f.name, f.size, f.mtime, f.dev, f.ino '
+            'FROM s.sdirs d LEFT JOIN s.files f ON f.dir = d.id ORDER BY d.id'):
+        if did != cur:
+            if cur is not None:
+                yield 'dir', rel_cur, files
+            cur, rel_cur, files = did, rel, []
+        if name is not None:
+            files.append((name, SavedStat(size, mtime, dev, ino)))
+    if cur is not None:
+        yield 'dir', rel_cur, files
+
+
+def classify(st, source, jobs, mode='compare', label=None, whole=(), source_jobs=1):
     """Fill p.src.cat: present / dup / new / older / newer / error. Returns unreadable target files.
     mode='compare' also forces empty files and whole folders (p.src.forced); mode='check' only
     asks whether the content is on the target (empty files: an empty file of the same name)."""
     db, target = st.db, st.target
     terr = []
+    par = separate_disks(target, source)
+    prefetch_db(db)
 
     # sizes worth hashing: shared with the target or with another source file
-    db.executescript('''
-        DROP TABLE IF EXISTS temp.csz;
-        CREATE TEMP TABLE csz(size INTEGER PRIMARY KEY);
-        INSERT OR IGNORE INTO csz SELECT size FROM p.src WHERE err IS NULL GROUP BY size HAVING count(*) > 1;
-        INSERT OR IGNORE INTO csz SELECT DISTINCT s.size FROM p.src s
-            WHERE s.err IS NULL AND EXISTS (SELECT 1 FROM main.files f WHERE f.size = s.size);
-    ''')
+    with step('matching file sizes against the target'):
+        db.executescript('''
+          DROP TABLE IF EXISTS temp.csz;
+          CREATE TEMP TABLE csz(size INTEGER PRIMARY KEY);
+          INSERT OR IGNORE INTO csz SELECT size FROM p.src WHERE err IS NULL GROUP BY size HAVING count(*) > 1;
+          INSERT OR IGNORE INTO csz SELECT DISTINCT s.size FROM p.src s
+              WHERE s.err IS NULL AND EXISTS (SELECT 1 FROM main.files f WHERE f.size = s.size);
+        ''')
 
     # --- stage 1: partial hashes
-    t_items = [(absp(target, rj(d, n)), size, fid) for fid, d, n, size in db.execute(
-        'SELECT f.id, d.path, f.name, f.size FROM main.files f JOIN main.dirs d ON d.id=f.dir '
-        'WHERE f.phash IS NULL AND f.size IN (SELECT size FROM csz) ORDER BY f.dev, f.ino')]
-    s_items = [(absp(source, rj(d, n)), size, sid, rj(d, n), mt) for sid, d, n, size, mt in db.execute(
-        'SELECT s.id, d.path, s.name, s.size, s.mtime FROM p.src s JOIN p.sdirs d ON d.id=s.dir '
-        'WHERE s.phash IS NULL AND s.err IS NULL AND s.size IN (SELECT size FROM csz) ORDER BY s.ino')]
-    _hash_phase(st, 'partial hash target', t_items, partial_hash, jobs, _store_t_partial, terr, partial=True)
-    _hash_phase(st, 'partial hash source', s_items, partial_hash, jobs, _store_s_partial, None, partial=True)
+    with step('listing files to hash'):
+        t_items = [(absp(target, rj(d, n)), size, fid) for fid, d, n, size in db.execute(
+            'SELECT f.id, d.path, f.name, f.size FROM main.files f JOIN main.dirs d ON d.id=f.dir '
+            'WHERE f.phash IS NULL AND f.size IN (SELECT size FROM csz) ORDER BY f.dev, f.ino')]
+        s_items = [(absp(source, rj(d, n)), size, sid, rj(d, n), mt) for sid, d, n, size, mt in db.execute(
+            'SELECT s.id, d.path, s.name, s.size, s.mtime FROM p.src s JOIN p.sdirs d ON d.id=s.dir '
+            'WHERE s.phash IS NULL AND s.err IS NULL AND s.size IN (SELECT size FROM csz) ORDER BY s.ino')]
+    _hash_phases(st, 'partial hash', [('target', t_items, jobs, _store_t_partial, terr),
+                                      ('source', s_items, source_jobs, _store_s_partial, None)],
+                 partial_hash, par, partial=True)
 
     # --- stage 2: full hashes for (size, phash) groups with >= 2 members incl. >= 1 source file
-    db.executescript('''
-        DROP TABLE IF EXISTS temp.cgrp;
-        CREATE TEMP TABLE cgrp(size INTEGER, phash BLOB, PRIMARY KEY(size, phash));
-        INSERT INTO cgrp SELECT size, phash FROM (
-            SELECT size, phash, 1 AS s FROM p.src WHERE err IS NULL AND phash IS NOT NULL
-            UNION ALL
-            SELECT size, phash, 0 FROM main.files
-                WHERE phash IS NOT NULL AND size IN (SELECT size FROM csz))
-        GROUP BY size, phash HAVING count(*) > 1 AND sum(s) > 0;
-    ''')
-    t_items = [(absp(target, rj(d, n)), size, fid) for fid, d, n, size in db.execute(
-        'SELECT f.id, d.path, f.name, f.size FROM main.files f '
-        'JOIN cgrp g ON f.size=g.size AND f.phash=g.phash JOIN main.dirs d ON d.id=f.dir '
-        'WHERE f.hash IS NULL ORDER BY f.dev, f.ino')]
-    s_items = [(absp(source, rj(d, n)), size, sid, rj(d, n), mt) for sid, d, n, size, mt in db.execute(
-        'SELECT s.id, d.path, s.name, s.size, s.mtime FROM p.src s '
-        'JOIN cgrp g ON s.size=g.size AND s.phash=g.phash JOIN p.sdirs d ON d.id=s.dir '
-        'WHERE s.hash IS NULL AND s.err IS NULL ORDER BY s.ino')]
-    _hash_phase(st, 'full hash target', t_items, full_hash, jobs, _store_t_full, terr)
-    _hash_phase(st, 'full hash source', s_items, full_hash, jobs, _store_s_full, None)
+    with step('finding candidates for full hashing'):
+        db.executescript('''
+            DROP TABLE IF EXISTS temp.cgrp;
+            CREATE TEMP TABLE cgrp(size INTEGER, phash BLOB, PRIMARY KEY(size, phash));
+            INSERT INTO cgrp SELECT size, phash FROM (
+                SELECT size, phash, 1 AS s FROM p.src WHERE err IS NULL AND phash IS NOT NULL
+                UNION ALL
+                SELECT size, phash, 0 FROM main.files
+                    WHERE phash IS NOT NULL AND size IN (SELECT size FROM csz))
+            GROUP BY size, phash HAVING count(*) > 1 AND sum(s) > 0;
+        ''')
+        # target: one unhashed file per group, and only where no target file of the group has a full
+        # hash yet; further copies are read only if that one doesn't match (round 2 below)
+        t_items = [(absp(target, rj(d, n)), size, fid) for fid, d, n, size in db.execute(
+            'SELECT f.id, d.path, f.name, f.size FROM main.files f JOIN main.dirs d ON d.id=f.dir '
+            'WHERE f.id IN (SELECT min(f1.id) FROM cgrp g JOIN main.files f1 '
+            '               ON f1.size=g.size AND f1.phash=g.phash AND f1.hash IS NULL '
+            '               WHERE NOT EXISTS (SELECT 1 FROM main.files f2 WHERE f2.size=g.size '
+            '                                 AND f2.phash=g.phash AND f2.hash IS NOT NULL) '
+            '               GROUP BY g.size, g.phash) '
+            'ORDER BY f.dev, f.ino')]
+        s_items = [(absp(source, rj(d, n)), size, sid, rj(d, n), mt) for sid, d, n, size, mt in db.execute(
+            'SELECT s.id, d.path, s.name, s.size, s.mtime FROM p.src s '
+            'JOIN cgrp g ON s.size=g.size AND s.phash=g.phash JOIN p.sdirs d ON d.id=s.dir '
+            'WHERE s.hash IS NULL AND s.err IS NULL ORDER BY s.ino')]
+    _hash_phases(st, 'full hash', [('target', t_items, jobs, _store_t_full, terr),
+                                   ('source', s_items, source_jobs, _store_s_full, None)],
+                 full_hash, par)
+
+    # round 2: groups where a source hash has no match on the target yet -> the remaining target copies
+    with step('checking which source files still lack a match'):
+        tried = {it[2] for it in t_items}
+        t_items = [(absp(target, rj(d, n)), size, fid) for fid, d, n, size in db.execute(
+            'SELECT f.id, d.path, f.name, f.size FROM main.files f JOIN main.dirs d ON d.id=f.dir '
+            'JOIN (SELECT DISTINCT s.size, s.phash FROM p.src s JOIN cgrp g ON s.size=g.size AND s.phash=g.phash '
+            '      WHERE s.err IS NULL AND s.hash IS NOT NULL '
+            '      AND NOT EXISTS (SELECT 1 FROM main.files f3 WHERE f3.hash=s.hash)) u '
+            'ON f.size=u.size AND f.phash=u.phash '
+            'WHERE f.hash IS NULL ORDER BY f.dev, f.ino') if fid not in tried]
+    _hash_phases(st, 'full hash', [('target (other copies)', t_items, jobs, _store_t_full, terr)],
+                 full_hash, False)
 
     # --- stage 3: categories
-    db.executescript('''
-        BEGIN;
-        UPDATE p.src SET cat=NULL, rep=NULL, tpath=NULL, tmtime=NULL;
-        UPDATE p.src SET cat='error' WHERE err IS NOT NULL;
-        UPDATE p.src SET cat='present' WHERE cat IS NULL AND hash IS NOT NULL
-            AND EXISTS (SELECT 1 FROM main.files f WHERE f.hash = src.hash);
+    with step('sorting files into categories'):
+        db.executescript('''
+            BEGIN;
+            UPDATE p.src SET cat=NULL, rep=NULL, tpath=NULL, tmtime=NULL;
+            UPDATE p.src SET cat='error' WHERE err IS NOT NULL;
+            UPDATE p.src SET cat='present' WHERE cat IS NULL AND hash IS NOT NULL
+                AND EXISTS (SELECT 1 FROM main.files f WHERE f.hash = src.hash);
 
-        -- several source copies of the same new content: copy one. Prefer the copy whose
-        -- folder is "most new" (keeps folders complete), then the oldest folder.
-        DROP TABLE IF EXISTS temp.dr;
-        CREATE TEMP TABLE dr AS SELECT dir, avg(cat IS NULL) AS r, min(mtime) AS mt
-            FROM p.src GROUP BY dir;
-        DROP TABLE IF EXISTS temp.rk;
-        CREATE TEMP TABLE rk AS
-            SELECT s.id AS id,
-                   row_number() OVER w AS rn,
-                   first_value(s.id) OVER w AS rep
-            FROM p.src s JOIN dr ON dr.dir=s.dir JOIN p.sdirs d ON d.id=s.dir
-            WHERE s.cat IS NULL AND s.hash IS NOT NULL
-            WINDOW w AS (PARTITION BY s.hash ORDER BY dr.r DESC, dr.mt, d.path, s.mtime, s.id);
-        CREATE INDEX temp.rk_id ON rk(id);
-        UPDATE p.src SET cat='dup', rep=(SELECT rep FROM rk WHERE rk.id=src.id)
-            WHERE id IN (SELECT id FROM rk WHERE rn > 1);
-        UPDATE p.src SET cat='new' WHERE cat IS NULL;
-        COMMIT;
-    ''')
+            -- several source copies of the same new content: copy one. Prefer the copy whose
+            -- folder is "most new" (keeps folders complete), then the oldest folder.
+            DROP TABLE IF EXISTS temp.dr;
+            CREATE TEMP TABLE dr AS SELECT dir, avg(cat IS NULL) AS r, min(mtime) AS mt
+                FROM p.src GROUP BY dir;
+            DROP TABLE IF EXISTS temp.rk;
+            CREATE TEMP TABLE rk AS
+                SELECT s.id AS id,
+                       row_number() OVER w AS rn,
+                       first_value(s.id) OVER w AS rep
+                FROM p.src s JOIN dr ON dr.dir=s.dir JOIN p.sdirs d ON d.id=s.dir
+                WHERE s.cat IS NULL AND s.hash IS NOT NULL
+                WINDOW w AS (PARTITION BY s.hash ORDER BY dr.r DESC, dr.mt, d.path, s.mtime, s.id);
+            CREATE INDEX temp.rk_id ON rk(id);
+            UPDATE p.src SET cat='dup', rep=(SELECT rep FROM rk WHERE rk.id=src.id)
+                WHERE id IN (SELECT id FROM rk WHERE rn > 1);
+            UPDATE p.src SET cat='new' WHERE cat IS NULL;
+            COMMIT;
+        ''')
 
     # new files that were never opened (unique size): make sure they are readable at all
     db.execute('BEGIN')
@@ -613,29 +831,31 @@ def classify(st, source, jobs, mode='compare', label=None, whole=()):
     db.execute('COMMIT')
 
     # older / newer versions: same file name in a same-named folder on the target (unique match)
-    db.execute('BEGIN')
-    cache = {}
-    rows = db.execute("SELECT s.id, s.name, s.mtime, d.path FROM p.src s JOIN p.sdirs d ON d.id=s.dir "
-                      "WHERE s.cat='new' AND s.forced IS NULL AND s.size > 0 AND d.path <> x''").fetchall()
-    for sid, name, mtime, dpath in rows:
-        lname = name.lower()
-        cands = cache.get(lname)
-        if cands is None:
-            if len(cache) > 200_000:
-                cache.clear()
-            cands = cache[lname] = [
-                (tdir.rsplit(b'/', 1)[-1].lower(), tm, rj(tdir, tname)) for tm, tdir, tname in db.execute(
-                    'SELECT f.mtime, d.path, f.name FROM main.files f JOIN main.dirs d ON d.id=f.dir '
-                    'WHERE f.lname=?', (lname,))]
-        parent = dpath.rsplit(b'/', 1)[-1].lower()
-        match = [(tm, tp) for pl, tm, tp in cands if pl == parent]
-        if len(match) == 1:
-            tm, tp = match[0]
-            cat = 'older' if tm > mtime + MTIME_TOL_NS else 'newer'
-            db.execute('UPDATE p.src SET cat=?, tpath=?, tmtime=? WHERE id=?', (cat, tp, tm, sid))
-    db.execute('COMMIT')
+    with step('looking for older/newer versions'):
+        db.execute('BEGIN')
+        cache = {}
+        rows = db.execute("SELECT s.id, s.name, s.mtime, d.path FROM p.src s JOIN p.sdirs d ON d.id=s.dir "
+                          "WHERE s.cat='new' AND s.forced IS NULL AND s.size > 0 AND d.path <> x''").fetchall()
+        for sid, name, mtime, dpath in rows:
+            lname = name.lower()
+            cands = cache.get(lname)
+            if cands is None:
+                if len(cache) > 200_000:
+                    cache.clear()
+                cands = cache[lname] = [
+                    (tdir.rsplit(b'/', 1)[-1].lower(), tm, rj(tdir, tname)) for tm, tdir, tname in db.execute(
+                        'SELECT f.mtime, d.path, f.name FROM main.files f JOIN main.dirs d ON d.id=f.dir '
+                        'WHERE f.lname=?', (lname,))]
+            parent = dpath.rsplit(b'/', 1)[-1].lower()
+            match = [(tm, tp) for pl, tm, tp in cands if pl == parent]
+            if len(match) == 1:
+                tm, tp = match[0]
+                cat = 'older' if tm > mtime + MTIME_TOL_NS else 'newer'
+                db.execute('UPDATE p.src SET cat=?, tpath=?, tmtime=? WHERE id=?', (cat, tp, tm, sid))
+        db.execute('COMMIT')
     if mode == 'compare':
-        keep_whole(db, whole)
+        with step('checking folders to keep whole'):
+            keep_whole(db, whole)
     return terr
 
 
@@ -701,21 +921,103 @@ def empty_dirs(db):
     return sorted(create)
 
 
-def _hash_phase(st, what, items, func, jobs, store, terr, partial=False):
-    if not items:
+def _hash_phases(st, what, sides, func, parallel, partial=False):
+    """sides: [(name, items, jobs, store, terr)]. With parallel=True (target and source on different
+    disks) every side is read in its own thread at the same time; database writes stay in this thread."""
+    sides = [sd for sd in sides if sd[1]]
+    if not sides:
         return
-    cost = (lambda s: min(s, 2 * CHUNK)) if partial else (lambda s: s)
-    prog = Progress(what, len(items), sum(cost(i[1]) for i in items))
+    cost = (lambda s: s if s <= FULL_READ_MAX else 2 * CHUNK) if partial else (lambda s: s)
+    progs = [Progress(f'{what} {name}', len(items), sum(cost(i[1]) for i in items))
+             for name, items, *_ in sides]
     tx = Tx(st.db)
-    for it, res in hash_many(items, func, jobs):
-        prog.add(1, cost(it[1]))
+
+    def put(i, it, res):
+        store, terr = sides[i][3], sides[i][4]
         if isinstance(res, OSError) and terr is not None:
             terr.append((it[0], res.strerror))
         else:
             store(st.db, it, res)
         tx.tick()
+
+    try:
+        _run_sides(sides, func, parallel, cost, progs, tx, put)
+    except KeyboardInterrupt:
+        tx.close()  # every stored hash is complete on its own: keep them, also when stopping
+        raise
     tx.close()
-    prog.done()
+
+
+def _run_sides(sides, func, parallel, cost, progs, tx, put):
+    if not parallel or len(sides) == 1:
+        for i, (name, items, jobs, *_) in enumerate(sides):
+            for it, res in hash_many(items, func, jobs):
+                progs[i].add(1, cost(it[1]))
+                put(i, it, res)
+            tx.flush()
+            progs[i].done()
+        return
+
+    q = queue.Queue(maxsize=4096)
+
+    def feed(i, items, jobs):
+        try:
+            for it, res in hash_many(items, func, jobs):
+                q.put((i, it, res))
+            q.put((i, None, None))
+        except BaseException as e:  # Stopped (Ctrl-C) or a bug: hand it to the main thread
+            q.put((i, None, e))
+
+    mp = MultiProgress(progs)
+    for i, (name, items, jobs, *_) in enumerate(sides):
+        threading.Thread(target=feed, args=(i, items, jobs), daemon=True).start()
+    running, failure = len(sides), None
+    while running:
+        try:
+            i, it, res = q.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if it is None:
+            running -= 1
+            mp.finish(i)
+            failure = failure or res
+            continue
+        mp.add(i, 1, cost(it[1]))
+        put(i, it, res)
+    if failure is not None:
+        raise failure
+    mp.done()
+
+
+def disk_of(path):
+    """Best effort: name of the physical disk holding path (e.g. 'sdb'), or None."""
+    path = os.fsdecode(os.path.realpath(path))
+    unesc = lambda x: re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), x)
+    best, dev = '', None
+    try:
+        with open('/proc/self/mountinfo') as f:
+            for line in f:
+                pre, post = line.split(' - ', 1)
+                mnt, src = unesc(pre.split()[4]), unesc(post.split()[1])
+                if (path == mnt or path.startswith(mnt.rstrip('/') + '/')) and len(mnt) >= len(best):
+                    best, dev = mnt, src
+    except (OSError, ValueError, IndexError):
+        return None
+    if not dev or not dev.startswith('/dev/'):
+        return None
+    name = os.path.basename(os.path.realpath(dev))
+    sysp = '/sys/class/block/' + name
+    if os.path.exists(sysp + '/partition'):
+        return os.path.basename(os.path.dirname(os.path.realpath(sysp)))
+    return name if os.path.exists(sysp) else None
+
+
+def separate_disks(target, source):
+    """True if target and source can be read at the same time without fighting over one disk."""
+    dt, ds = disk_of(target), disk_of(source)
+    if dt and ds:
+        return dt != ds
+    return os.stat(target).st_dev != os.stat(source).st_dev
 
 
 def _store_t_partial(db, it, res):
@@ -972,6 +1274,7 @@ def cmd_index(args):
 def cmd_compare(args):
     target, source, label, prune = resolve(args)
     st = Store(target)
+    expect = previous_scan_count(st, label, source)
     old_plan = st.plan_path(label, 'plan')
     if os.path.exists(old_plan):
         st.attach(old_plan, 'o')
@@ -996,8 +1299,22 @@ def cmd_compare(args):
                  ('complete', '0')):
         st.set_meta(k, v, 'p')
     st.db.execute('COMMIT')
-    scan_source(st, source, excludes, prune)
-    terr = classify(st, source, args.jobs, 'compare', label, whole)
+    scanned = None if args.rescan else attach_saved_scan(st, label, source, excludes)
+    if scanned is None:
+        scan_source(st, source, excludes, prune, expect=expect)
+        save_scan(st, label, source, excludes)
+    else:
+        age = time.time() - scanned
+        when = time.strftime('%Y-%m-%d %H:%M', time.localtime(scanned))
+        if age > SCAN_MAX_AGE:
+            print(f'WARNING: reusing the source scan from {when} ({hdur(age)} old). Files added or '
+                  f'changed on the source since then are not seen; pass --rescan to scan again '
+                  f'(check always rescans).', file=sys.stderr)
+        else:
+            print(f'reusing the source scan from {when} ({hdur(age)} old); --rescan to scan again')
+        scan_source(st, source, excludes, prune, saved_events(st.db), 'loading saved scan')
+        st.db.execute('DETACH s')
+    terr = classify(st, source, args.jobs, 'compare', label, whole, args.source_jobs)
     st.db.execute('BEGIN')
     st.set_meta('complete', '1', 'p')
     st.db.execute('COMMIT')
@@ -1301,11 +1618,12 @@ def cmd_check(args):
             pass
         st.db.execute('DETACH o')
     excludes = source_excludes(args, prev_ex)
+    expect = previous_scan_count(st, label, source)
     stale = ensure_index(st, args)
     st.new_plan(label, 'check')
     st.attach_cache(label)
-    scan_source(st, source, excludes, prune)
-    terr = classify(st, source, args.jobs, 'check')
+    scan_source(st, source, excludes, prune, expect=expect)
+    terr = classify(st, source, args.jobs, 'check', source_jobs=args.source_jobs)
 
     db = st.db
     missing = db.execute("SELECT d.path, s.name, s.size, s.cat FROM p.src s JOIN p.sdirs d ON d.id=s.dir "
@@ -1379,7 +1697,7 @@ def main():
                         '(--exclude "" to clear)')
     p.add_argument('--rehash-all', action='store_true', help='forget all stored hashes')
     p.add_argument('--hash-all', action='store_true', help='hash every target file now instead of on demand')
-    p.add_argument('--jobs', type=int, default=1, help='parallel hashing threads (SSD: 4-8, HDD: 1)')
+    p.add_argument('--jobs', type=int, default=1, help='parallel hashing threads (SSD: 4-8, btrfs RAID1: 4, single HDD: 1)')
     p.set_defaults(func=cmd_index)
 
     for name, func, hlp in (('compare', cmd_compare, 'scan a source, report, write copy plan'),
@@ -1397,13 +1715,18 @@ def main():
                            help='extra glob on name or relative path to skip on the source')
             p.add_argument('--no-default-excludes', action='store_true',
                            help='also scan ' + ', '.join(DEFAULT_SOURCE_EXCLUDES))
-            p.add_argument('--jobs', type=int, default=1, help='parallel hashing threads (SSD: 4-8, HDD: 1)')
+            p.add_argument('--jobs', type=int, default=1,
+                           help='hashing threads on the target (SSD: 4-8, btrfs RAID1: 4, single HDD: 1)')
+            p.add_argument('--source-jobs', type=int, default=1,
+                           help='hashing threads on the source (SSD: 4-8, HDD: 1)')
         if name == 'compare':
             p.add_argument('--depth', type=int, default=3, help='folder levels shown on screen (default 3)')
             p.add_argument('--whole', action='append', metavar='PATTERN',
                            help='glob on folder name or relative path: if anything in such a folder is new, '
                                 'copy the whole folder (git repos are always kept whole)')
             p.add_argument('--no-git-whole', action='store_true', help="don't keep git repos whole")
+            p.add_argument('--rescan', action='store_true',
+                           help='walk the source again instead of reusing the saved scan of the last compare')
         if name == 'import':
             p.add_argument('--ignore-space', action='store_true', help='skip the free-space check')
         p.set_defaults(func=func)

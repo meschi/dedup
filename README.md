@@ -44,7 +44,8 @@ Optional:
 
 **Interrupted? Just run the same command again.** Ctrl-C (or a closed terminal) stops cleanly and
 prints the command to continue. Already computed hashes and already copied files are kept and
-skipped. Only the quick scan of file names and sizes starts over. Press Ctrl-C twice to quit at once.
+skipped, and `compare` reuses its scan of the source folder (it warns if that scan is more than an
+hour old). Press Ctrl-C twice to quit at once.
 
 ## Details
 
@@ -73,8 +74,9 @@ the target, so you can always trace where a file went.
 ### How it works
 
 - Files are compared by a content hash (BLAKE2b). Only files whose size matches another file
-  are read at all, first just their beginning and end, then fully if needed. Files with a unique size
-  are never hashed.
+  are read at all, first just their beginning and end, then fully if needed (files up to 2 MiB are
+  read once in full right away). Files with a unique size are never hashed. If the target holds
+  several copies of a file, only one is read to confirm a match; the others are hashed when needed.
 - The target index lives in `TARGET/.dedup/index.sqlite`, roughly 500 bytes per file (≈ 3 GB for
   6 million files). Every command refreshes it first by checking file sizes and timestamps, without
   reading file contents. So it's fine to keep editing and reorganising the target between runs, and
@@ -89,7 +91,12 @@ the target, so you can always trace where a file went.
 - Mount sources read-only if you can: `sudo mount -o remount,ro /run/media/me/old\ drive`.
 - Keep btrfs snapshots outside the target folder, or exclude them (`index --exclude .snapshots`).
   Otherwise a file that only survives in a snapshot would count as present.
-- `--jobs 4` hashes in parallel. That helps on SSDs; leave it at 1 for spinning disks.
+- Target and source are read at the same time when they are on different disks.
+  `--jobs N` sets the hashing threads on the target, `--source-jobs N` on the source. More threads help on
+  SSDs and on btrfs RAID1 (each thread reads from one mirror, so a single thread uses only one disk);
+  leave them at 1 for a single spinning disk.
+- `compare --rescan` walks the source again instead of reusing the scan from the last `compare`
+  (stored in `TARGET/.dedup/plans/`). Use it if the source changed since then. `check` always rescans.
 - `--no-reindex` (compare/import/check) skips the index refresh, which can take an hour on large
   HDD targets. Only use it if you haven't changed the target since the last run. Files deleted
   since then would still count as present. Before wiping a drive, run `check` without it.
