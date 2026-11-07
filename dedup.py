@@ -406,6 +406,7 @@ CREATE INDEX p.src_cat ON src(cat);
 CACHE_SCHEMA = '''
 CREATE TABLE IF NOT EXISTS c.cache(path BLOB PRIMARY KEY, size INTEGER, mtime INTEGER,
                                    phash BLOB, hash BLOB) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS c.meta(k TEXT PRIMARY KEY, v TEXT);
 '''
 
 
@@ -450,9 +451,26 @@ class Store:
         self.attach(path, 'p')
         self.db.executescript(PLAN_SCHEMA)
 
-    def attach_cache(self, label):
+    def attach_cache(self, label, source):
+        """The cache holds source hashes by (path, size, mtime); it is only trusted for the same
+        source folder on the same filesystem (UUID). Otherwise -- another drive with the same label,
+        or the identity can't be determined -- it is emptied."""
         self.attach(self.plan_path(label, 'cache'), 'c')
         self.db.executescript(CACHE_SCHEMA)
+        ident = source_identity(source)
+        stored = self.meta('source', None, 'c')
+        if stored is None and ident is not None:
+            # cache from a version that didn't record its source yet: adopt it
+            self.set_meta('source', ident, 'c')
+            self.db.commit()
+        elif ident is None or stored != ident:
+            self.db.execute('BEGIN')
+            n = self.db.execute('DELETE FROM c.cache').rowcount
+            self.set_meta('source', ident or '', 'c')
+            self.db.execute('COMMIT')
+            if n:
+                print(f'source hash cache for label {show(label)} belongs to another source '
+                      f'(or this one can\'t be identified): discarded {n:,} cached hashes', file=sys.stderr)
 
     def free_bytes(self):
         s = os.statvfs(self.target)
@@ -888,7 +906,10 @@ def keep_whole(db, whole):
             arg = (r, len(r) + 1, r + b'/')
         else:
             sub, arg = '(SELECT id FROM p.sdirs)', ()
-        q = f"SELECT 1 FROM p.src WHERE dir IN {sub} AND cat IN ('new','older','newer') LIMIT 1"
+        # empty files don't count: they are always copied and can't be matched, so nearly every
+        # repo would be copied whole just because of an empty __init__.py or .git/refs file
+        q = (f"SELECT 1 FROM p.src WHERE dir IN {sub} AND cat IN ('new','older','newer') "
+             f"AND forced IS NULL LIMIT 1")
         if not db.execute(q, arg).fetchone():
             continue  # nothing new in there: the folder already exists on the target
         n, b = db.execute(f"SELECT count(*), coalesce(sum(size),0) FROM p.src WHERE dir IN {sub} "
@@ -989,20 +1010,52 @@ def _run_sides(sides, func, parallel, cost, progs, tx, put):
     mp.done()
 
 
-def disk_of(path):
-    """Best effort: name of the physical disk holding path (e.g. 'sdb'), or None."""
+def mount_of(path):
+    """-> (mount point, folder of the filesystem mounted there, device) for the mount holding
+    path, from /proc/self/mountinfo; (None, None, None) if unknown."""
     path = os.fsdecode(os.path.realpath(path))
     unesc = lambda x: re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), x)
-    best, dev = '', None
+    best = (None, None, None)
     try:
         with open('/proc/self/mountinfo') as f:
             for line in f:
                 pre, post = line.split(' - ', 1)
-                mnt, src = unesc(pre.split()[4]), unesc(post.split()[1])
-                if (path == mnt or path.startswith(mnt.rstrip('/') + '/')) and len(mnt) >= len(best):
-                    best, dev = mnt, src
+                fields = pre.split()
+                mnt, root, src = unesc(fields[4]), unesc(fields[3]), unesc(post.split()[1])
+                if ((path == mnt or path.startswith(mnt.rstrip('/') + '/'))
+                        and len(mnt) >= len(best[0] or '')):
+                    best = (mnt, root, src)
     except (OSError, ValueError, IndexError):
+        return None, None, None
+    return best
+
+
+def source_identity(path):
+    """'<filesystem UUID>:<path inside that filesystem>', or None if the UUID can't be found.
+    Stays the same when a drive is mounted elsewhere; differs between two drives mounted
+    one after the other at the same path."""
+    mnt, root, dev = mount_of(path)
+    if not dev or not dev.startswith('/dev/'):
         return None
+    dev = os.path.realpath(dev)
+    uuid = None
+    try:
+        for name in os.listdir('/dev/disk/by-uuid'):
+            if os.path.realpath('/dev/disk/by-uuid/' + name) == dev:
+                uuid = name
+                break
+    except OSError:
+        return None
+    if uuid is None:
+        return None
+    rel = os.path.relpath(os.fsdecode(os.path.realpath(path)), mnt)
+    # btrfs: one UUID covers all subvolumes; mountinfo's root names the subvolume
+    return f'{uuid}:{os.path.normpath(os.path.join(root, rel))}'
+
+
+def disk_of(path):
+    """Best effort: name of the physical disk holding path (e.g. 'sdb'), or None."""
+    _, _, dev = mount_of(path)
     if not dev or not dev.startswith('/dev/'):
         return None
     name = os.path.basename(os.path.realpath(dev))
@@ -1291,7 +1344,7 @@ def cmd_compare(args):
     whole = ([] if args.no_git_whole else ['.git']) + (args.whole or [])
     stale = ensure_index(st, args)
     st.new_plan(label, 'plan')
-    st.attach_cache(label)
+    st.attach_cache(label, source)
     st.db.execute('BEGIN')
     for k, v in (('source', os.fsdecode(source)), ('label', os.fsdecode(label)),
                  ('excludes', json.dumps(excludes)), ('whole', json.dumps(whole)),
@@ -1372,7 +1425,7 @@ def cmd_import(args):
         die('plan is incomplete (compare was interrupted) — run compare again')
     if os.fsencode(st.meta('source', '', 'p')) != source:
         die(f'plan was made for {st.meta("source", "", "p")} — run compare for this source')
-    st.attach_cache(label)
+    st.attach_cache(label, source)
     stale = ensure_index(st, args)
     gen = int(st.meta('gen'))
 
@@ -1621,7 +1674,7 @@ def cmd_check(args):
     expect = previous_scan_count(st, label, source)
     stale = ensure_index(st, args)
     st.new_plan(label, 'check')
-    st.attach_cache(label)
+    st.attach_cache(label, source)
     scan_source(st, source, excludes, prune, expect=expect)
     terr = classify(st, source, args.jobs, 'check', source_jobs=args.source_jobs)
 
